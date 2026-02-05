@@ -1,0 +1,31 @@
+# ESP-IDF build
+build/
+sdkconfig.old
+sdkconfig.defaults.old
+
+# Keep sdkconfig for project settings
+# But you can uncomment this if you prefer sdkconfig.defaults only
+# sdkconfig
+
+# Dependencies
+managed_components/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+venv/
+
+# Logs
+*.log
