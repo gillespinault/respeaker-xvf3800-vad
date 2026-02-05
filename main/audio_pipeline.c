@@ -17,7 +17,6 @@
 // ESP-SR includes
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
-#include "model_path.h"
 
 static const char *TAG = "audio_pipeline";
 
@@ -81,7 +80,7 @@ static esp_err_t init_i2s(void)
 }
 
 /**
- * @brief Initialize ESP-SR AFE with VADNet
+ * @brief Initialize ESP-SR AFE with VAD
  */
 static esp_err_t init_afe(void)
 {
@@ -100,14 +99,17 @@ static esp_err_t init_afe(void)
 
     // VAD configuration
     afe_config.vad_init = true;
-    afe_config.vad_mode = VAD_MODE_4;  // Higher = more sensitive
-    afe_config.vad_min_speech_ms = 100;
-    afe_config.vad_min_noise_ms = 500;
+    afe_config.vad_mode = VAD_MODE_2;  // Moderate sensitivity (0-4)
 
     // Disable features already handled by XVF3800
     afe_config.aec_init = false;  // AEC done by XVF3800
     afe_config.se_init = false;   // Noise suppression done by XVF3800
     afe_config.wakenet_init = false;  // We only want VAD
+    afe_config.wakenet_model_name = NULL;
+
+    // Memory allocation mode
+    afe_config.memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_config.afe_mode = SR_MODE_LOW_COST;
 
     // Create AFE instance
     s_afe_data = s_afe_handle->create_from_config(&afe_config);
@@ -116,7 +118,7 @@ static esp_err_t init_afe(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "ESP-SR AFE with VADNet initialized");
+    ESP_LOGI(TAG, "ESP-SR AFE with VAD initialized");
     return ESP_OK;
 }
 
@@ -126,7 +128,7 @@ static esp_err_t init_afe(void)
 static void audio_feed_task(void *arg)
 {
     int feed_chunksize = s_afe_handle->get_feed_chunksize(s_afe_data);
-    int feed_channel = s_afe_handle->get_feed_channel_num(s_afe_data);
+    int feed_channel = s_afe_handle->get_total_channel_num(s_afe_data);
 
     int16_t *feed_buffer = heap_caps_malloc(feed_chunksize * feed_channel * sizeof(int16_t), MALLOC_CAP_INTERNAL);
     int32_t *i2s_buffer = heap_caps_malloc(feed_chunksize * 2 * sizeof(int32_t), MALLOC_CAP_INTERNAL);
