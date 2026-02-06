@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
+#include <string.h>
 
 // ESP-SR includes
 #include "esp_afe_sr_iface.h"
@@ -20,16 +21,12 @@
 
 static const char *TAG = "audio_pipeline";
 
-// I2S Configuration (audio from XVF3800)
+// I2S Configuration (RX only - audio from XVF3800)
 #define I2S_NUM             I2S_NUM_1
 #define I2S_BCK_PIN         8
 #define I2S_WS_PIN          7
 #define I2S_DIN_PIN         43
 #define I2S_SAMPLE_RATE     16000
-#define I2S_BITS            32
-
-// Audio buffer
-#define AUDIO_CHUNKSIZE     512
 
 // Task configuration
 #define FEED_TASK_STACK     4096
@@ -44,18 +41,19 @@ static esp_afe_sr_data_t *s_afe_data = NULL;
 static TaskHandle_t s_feed_task = NULL;
 static TaskHandle_t s_detect_task = NULL;
 static bool s_running = false;
-static bool s_is_speaking = false;
 static audio_pipeline_config_t s_config = {0};
 
 /**
- * @brief Initialize I2S for receiving audio from XVF3800
+ * @brief Initialize I2S for RX only (audio from XVF3800)
  */
 static esp_err_t init_i2s(void)
 {
+    // Create RX channel only
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &s_i2s_rx_handle));
 
-    i2s_std_config_t std_cfg = {
+    // Configure RX for 32-bit stereo (matching XVF3800 output)
+    i2s_std_config_t rx_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
@@ -72,10 +70,10 @@ static esp_err_t init_i2s(void)
         },
     };
 
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx_handle, &rx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx_handle));
 
-    ESP_LOGI(TAG, "I2S initialized (BCK=%d, WS=%d, DIN=%d)", I2S_BCK_PIN, I2S_WS_PIN, I2S_DIN_PIN);
+    ESP_LOGI(TAG, "I2S RX initialized (BCK=%d, WS=%d, DIN=%d)", I2S_BCK_PIN, I2S_WS_PIN, I2S_DIN_PIN);
     return ESP_OK;
 }
 
@@ -99,7 +97,7 @@ static esp_err_t init_afe(void)
 
     // VAD configuration
     afe_config.vad_init = true;
-    afe_config.vad_mode = VAD_MODE_2;  // Moderate sensitivity (0-4)
+    afe_config.vad_mode = VAD_MODE_3;  // Less sensitive (0=most sensitive, 4=least)
 
     // Disable features already handled by XVF3800
     afe_config.aec_init = false;  // AEC done by XVF3800
@@ -142,6 +140,8 @@ static void audio_feed_task(void *arg)
     ESP_LOGI(TAG, "Feed task started (chunksize=%d, channels=%d)", feed_chunksize, feed_channel);
 
     size_t bytes_read;
+    int debug_counter = 0;
+    int32_t max_sample = 0;
     while (s_running) {
         // Read from I2S (32-bit stereo)
         esp_err_t ret = i2s_channel_read(s_i2s_rx_handle, i2s_buffer,
@@ -149,7 +149,20 @@ static void audio_feed_task(void *arg)
                                           &bytes_read, pdMS_TO_TICKS(100));
 
         if (ret != ESP_OK || bytes_read == 0) {
+            if (debug_counter++ % 100 == 0) {
+                ESP_LOGW(TAG, "I2S read failed or empty: ret=%d, bytes=%d", ret, bytes_read);
+            }
             continue;
+        }
+
+        // Debug: check audio levels every ~3 seconds
+        for (int i = 0; i < bytes_read / sizeof(int32_t); i++) {
+            int32_t abs_val = i2s_buffer[i] < 0 ? -i2s_buffer[i] : i2s_buffer[i];
+            if (abs_val > max_sample) max_sample = abs_val;
+        }
+        if (debug_counter++ % 100 == 0) {
+            ESP_LOGI(TAG, "Audio level: max=%ld (bytes=%d)", (long)max_sample, bytes_read);
+            max_sample = 0;
         }
 
         // Convert 32-bit to 16-bit (take upper 16 bits)
@@ -173,6 +186,7 @@ static void audio_feed_task(void *arg)
 static void vad_detect_task(void *arg)
 {
     ESP_LOGI(TAG, "VAD detect task started");
+    int fetch_count = 0;
 
     while (s_running) {
         afe_fetch_result_t *result = s_afe_handle->fetch(s_afe_data);
@@ -182,18 +196,20 @@ static void vad_detect_task(void *arg)
             continue;
         }
 
-        // Check VAD state
+        fetch_count++;
+        // Debug VAD state periodically
+        if (fetch_count % 100 == 0) {
+            ESP_LOGI(TAG, "VAD state: %d (fetch #%d)", result->vad_state, fetch_count);
+        }
+
+        // Check VAD state - call callbacks continuously for debouncing in main
         bool speech_detected = (result->vad_state == AFE_VAD_SPEECH);
 
-        if (speech_detected && !s_is_speaking) {
-            // Speech started
-            s_is_speaking = true;
+        if (speech_detected) {
             if (s_config.on_speech_start) {
                 s_config.on_speech_start();
             }
-        } else if (!speech_detected && s_is_speaking) {
-            // Speech ended
-            s_is_speaking = false;
+        } else {
             if (s_config.on_speech_end) {
                 s_config.on_speech_end();
             }
@@ -250,9 +266,4 @@ void audio_pipeline_deinit(void)
         i2s_del_channel(s_i2s_rx_handle);
         s_i2s_rx_handle = NULL;
     }
-}
-
-bool audio_pipeline_is_speaking(void)
-{
-    return s_is_speaking;
 }
